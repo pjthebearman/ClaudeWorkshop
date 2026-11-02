@@ -67,8 +67,12 @@ def load_file(path):
     state.update(path=path, info=info, version=state["version"] + 1)
 
 
-# NVIDIA names recordings "<Game> 2026.11.02 - 20.15.33.01.mp4" (older versions put the date as 11.02.2026).
-NVIDIA_NAME = re.compile(r"^(?P<game>.+?)\s+\d{2,4}\.\d{2}\.\d{2,4}\s*-\s*\d{2}\.\d{2}\.\d{2}")
+# Recordings are named "<Game> <date> <time>", e.g. "World of Warcraft 2026-10-15 21-58-50" or
+# "Apex Legends 2026.11.02 - 20.15.33.01"; the date may also be day/month first (15.10.2026).
+SEP = r"[.\-_]"
+NVIDIA_NAME = re.compile(
+    rf"^(?P<game>.+?)[\s_-]+(?:\d{{4}}{SEP}\d{{2}}{SEP}\d{{2}}|\d{{2}}{SEP}\d{{2}}{SEP}\d{{4}})"
+    rf"(?:\s*-\s*|[\s_]+)\d{{2}}{SEP}\d{{2}}{SEP}\d{{2}}")
 RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
 
 
