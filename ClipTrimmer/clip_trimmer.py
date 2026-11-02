@@ -583,6 +583,7 @@ PAGE = r"""<!doctype html>
   input, select, button { font: inherit; color: inherit; background: transparent; border: 1px solid var(--line); border-radius: 4px; padding: 5px 9px; }
   input { width: 7.5em; }
   input.wide { width: 22em; max-width: 60vw; }
+  select, option { background: var(--bg); color: var(--fg); }  /* Windows draws the open list on white otherwise */
   button { cursor: pointer; }
   button:hover { border-color: var(--accent); }
   button.main { background: var(--accent); color: var(--bg); border-color: var(--accent); }
