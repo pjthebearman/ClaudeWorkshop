@@ -22,6 +22,11 @@ No other packages are needed.
 The editor opens in your browser. Keep the small terminal window open while
 you work; closing it (or pressing **Quit**) stops the tool.
 
+To switch clips, drag the next one onto `Clip Trimmer.bat` (or use **Open
+another…**). If Clip Trimmer is already running, it hands the clip over and
+closes straight away, and the open tab switches to it within a second. If
+you'd closed the tab, a new one opens.
+
 1. Scrub to the moment. The selection starts as the last 30 seconds, since
    that's usually where the replay moment is.
 2. Press **I** / **O** (or the buttons) to set the start and end, or type times

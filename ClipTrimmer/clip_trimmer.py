@@ -18,6 +18,9 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
+import urllib.error
+import urllib.request
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -30,7 +33,9 @@ VIDEO_TYPES = {".mp4": "video/mp4", ".m4v": "video/mp4", ".mov": "video/mp4",
                ".mkv": "video/webm", ".webm": "video/webm"}
 DISCORD_LIMITS = {20: "20 MB (free)", 50: "50 MB (Nitro Basic)", 500: "500 MB (Nitro)"}
 
-state = {"path": None, "info": None, "version": 0}
+state = {"path": None, "info": None, "version": 0, "url": None, "seen": 0.0}
+# Lets a second launch (e.g. dragging another clip onto the .bat) hand its file to the running copy.
+INSTANCE_FILE = Path(tempfile.gettempdir()) / "clip_trimmer_instance.json"
 job = {"state": "idle", "progress": 0.0, "message": "", "output": None}
 job_lock = threading.Lock()
 dialog_requests = queue.Queue()  # file dialogs must run on the main thread
@@ -457,6 +462,7 @@ class Handler(BaseHTTPRequestHandler):
         elif url.path == "/video":
             self.send_video()
         elif url.path == "/api/state":
+            state["seen"] = time.monotonic()
             path = state["path"]
             self.send_json({"name": path.name if path else None, "folder": str(path.parent) if path else None,
                             "version": state["version"], "info": state["info"], "job": job,
@@ -499,7 +505,7 @@ class Handler(BaseHTTPRequestHandler):
                         break
                     self.wfile.write(chunk)
                     remaining -= len(chunk)
-        except (BrokenPipeError, ConnectionResetError):
+        except ConnectionError:
             pass  # the browser cancels requests all the time while seeking
 
     def do_POST(self):
@@ -547,11 +553,49 @@ class Handler(BaseHTTPRequestHandler):
             if job.get("output"):
                 reveal(job["output"])
             self.send_json({"ok": True})
+        elif url.path == "/api/load":  # from a second launch
+            if job["state"] == "running":
+                return self.send_json({"error": "Clip Trimmer is busy exporting. Try again when it finishes."}, 409)
+            try:
+                load_file(str(body.get("path", "")))
+            except Exception as e:
+                return self.send_json({"error": f"Couldn't open that file: {e}"}, 400)
+            job.update(state="idle", progress=0.0, message="", output=None)
+            # The open page picks the new clip up by itself; if the tab was closed, open a new one.
+            if time.monotonic() - state["seen"] > 5 and not os.environ.get("CLIP_TRIMMER_NO_BROWSER"):
+                webbrowser.open(state["url"])
+            self.send_json({"ok": True})
         elif url.path == "/api/quit":
             self.send_json({"ok": True})
             dialog_requests.put(None)
         else:
             self.send_error(404)
+
+
+class Server(ThreadingHTTPServer):
+    def handle_error(self, request, client_address):
+        if not isinstance(sys.exc_info()[1], ConnectionError):  # closed tabs and seeking are normal
+            super().handle_error(request, client_address)
+
+
+def hand_off(path):
+    """Give the file to an already-running Clip Trimmer. Returns its reply, or None if none is running."""
+    try:
+        running = json.loads(INSTANCE_FILE.read_text())
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{int(running['port'])}/api/load",
+            data=json.dumps({"path": str(Path(path).expanduser().resolve())}).encode(),
+            headers={"X-Token": running["token"], "Content-Type": "application/json"})
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # never via a proxy
+        with opener.open(request, timeout=10) as reply:
+            return json.loads(reply.read())
+    except urllib.error.HTTPError as e:
+        try:
+            return json.loads(e.read())
+        except ValueError:
+            return None
+    except Exception:
+        return None  # no file, stale file, or nothing listening
 
 
 def main():
@@ -566,6 +610,15 @@ def main():
     if not path:
         print("No file chosen.")
         return 0
+    reply = hand_off(path)
+    if reply and reply.get("ok"):
+        print("Opened in the Clip Trimmer that's already running.")
+        return 0
+    if reply:
+        print(reply.get("error", "Clip Trimmer couldn't open that file."))
+        input("Press Enter to close.")
+        return 1
+
     try:
         load_file(path)
     except Exception as e:
@@ -573,9 +626,13 @@ def main():
         input("Press Enter to close.")
         return 1
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    url = f"http://127.0.0.1:{server.server_port}/?t={TOKEN}"
+    server = Server(("127.0.0.1", 0), Handler)
+    url = state["url"] = f"http://127.0.0.1:{server.server_port}/?t={TOKEN}"
     threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        INSTANCE_FILE.write_text(json.dumps({"port": server.server_port, "token": TOKEN}))
+    except OSError:
+        pass  # dropping more clips will just open another copy
     print(f"Clip Trimmer is open in your browser. If it isn't, visit:\n  {url}")
     print("Keep this window open while you work. Close it (or press Ctrl+C) to quit.")
     if not os.environ.get("CLIP_TRIMMER_NO_BROWSER"):
@@ -599,6 +656,12 @@ def main():
                 reply.put(e)
     except KeyboardInterrupt:
         pass
+    finally:
+        try:
+            if json.loads(INSTANCE_FILE.read_text()).get("token") == TOKEN:
+                INSTANCE_FILE.unlink()
+        except (OSError, ValueError):
+            pass
     server.shutdown()
     return 0
 
@@ -683,7 +746,7 @@ PAGE = r"""<!doctype html>
 const T = new URLSearchParams(location.search).get('t');
 const $ = id => document.getElementById(id);
 const video = $('video');
-let info = null, version = -1, start = 0, end = 0, previewing = false, polling = null;
+let info = null, version = -1, start = 0, end = 0, previewing = false, closed = false;
 
 async function api(path, body) {
   const res = await fetch(path, {
@@ -731,6 +794,9 @@ async function load() {
     $('codec').hidden = true;
     $('name').value = '';
     $('saveTo').textContent = 'Saves to ' + s.save_to;
+    document.title = s.name + ' · Clip Trimmer';
+    lastJob = '';
+    video.pause();
     video.src = '/video?t=' + encodeURIComponent(T) + '&v=' + version;
     start = Math.max(0, info.duration - 30); end = info.duration;
     render();
@@ -738,8 +804,13 @@ async function load() {
   showJob(s.job);
 }
 
+let lastJob = '';
 function showJob(job) {
   const running = job.state === 'running';
+  $('progress').value = job.progress;
+  const key = job.state + '|' + job.message;
+  if (key === lastJob) return;  // polling: leave the page (and any message on it) alone
+  lastJob = key;
   $('exportOriginal').disabled = $('exportDiscord').disabled = $('open').disabled = running;
   $('status').hidden = job.state === 'idle' || job.state === 'error';
   $('progress').value = job.progress;
@@ -747,10 +818,13 @@ function showJob(job) {
   $('message').textContent = job.message;
   $('reveal').hidden = job.state !== 'done';
   $('error').textContent = job.state === 'error' ? job.message : '';
-  if (running && !polling) polling = setInterval(poll, 500);
-  if (!running && polling) { clearInterval(polling); polling = null; }
 }
-async function poll() { try { showJob((await api('/api/state')).job); } catch (e) { $('error').textContent = 'Lost connection to Clip Trimmer. Is its window still open?'; } }
+// Keep checking in: shows export progress, and picks up clips dropped onto the .bat while this is open.
+async function poll() {
+  if (closed) return;
+  try { await load(); } catch (e) { $('error').textContent = 'Lost connection to Clip Trimmer. Is its window still open?'; }
+}
+setInterval(poll, 700);
 
 async function exportClip(mode) {
   $('error').textContent = '';
@@ -794,6 +868,7 @@ $('open').onclick = async () => {
   try { await api('/api/open', {}); await load(); } catch (e) { $('error').textContent = e.message; }
 };
 $('quit').onclick = async () => {
+  closed = true;
   await api('/api/quit', {}).catch(() => {});
   document.body.innerHTML = '<main><h1>Clip Trimmer closed</h1><p>You can close this tab.</p></main>';
 };
