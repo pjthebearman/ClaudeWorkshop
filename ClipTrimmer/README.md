@@ -57,9 +57,10 @@ reading. It works with either export button.
 
 It works by measuring how much of the screen changes ten times a second, so
 background shimmer and sparkle are ignored. Sudden game sounds count as action
-too: an attack's sound keeps the attacker moving forward just before it. Only
-the first audio track is used, so a separate mic track doesn't count. On a
-2:18 Arena game, *Cut idle time* gave 1:42 and *Aggressive* gave 1:09. The finished message says how much
+too, along with the movement that set them up. For an attack that means
+declaring the attacker (gold border, tilting forward), then the lunge, hit and
+damage. Only the first audio track is used, so a separate mic track doesn't
+count. On a 2:18 Arena game, *Cut idle time* gave 1:42 and *Aggressive* gave 1:14. The finished message says how much
 was cut. Background music jumps at each cut; a tiny fade stops clicks.
 
 | Export | What you get |

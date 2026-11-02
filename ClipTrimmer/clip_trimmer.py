@@ -159,7 +159,10 @@ IDLE_SETTINGS = {
 # the quiet music, so a jump this big above the previous second also counts as action, along with a
 # little time before it to show what caused the sound: back to the start of the last visible movement
 # (e.g. the attacker tilting forward), searching up to SOUND_LOOKBACK seconds.
-SOUND_RISE_DB, SOUND_PREROLL, SOUND_LOOKBACK = 12, 0.6, 1.5
+SOUND_RISE_DB, SOUND_PREROLL, SOUND_LOOKBACK = 12, 0.6, 2.5
+# Recordings can have tiny gaps in their audio; this fills them with silence so sound stays in step
+# with the video (otherwise it drifts earlier with every gap, ~0.6s by 1.5 minutes into a clip).
+FILL_AUDIO_GAPS = "aresample=async=1:min_hard_comp=0.01"
 MAX_PIECES = 50  # keeps the ffmpeg command comfortably under Windows' length limit
 
 
@@ -174,7 +177,7 @@ def analyze(start, duration, tracks=0):
         changed("soft", 18), changed("hard", 40)])
     labels = ["bright", "soft", "hard"]
     if tracks:  # first track only: it's the game; a second NVIDIA track is your mic
-        graph += (f";[0:a:0]aresample=16000,asetnsamples={int(16000 * STEP)},astats=metadata=1:reset=1,"
+        graph += (f";[0:a:0]{FILL_AUDIO_GAPS},aresample=16000,asetnsamples={int(16000 * STEP)},astats=metadata=1:reset=1,"
                   "ametadata=print:key=lavfi.astats.Overall.RMS_level:file=sound.txt[osound]")
         labels.append("sound")
     with tempfile.TemporaryDirectory() as tmp:  # relative file names avoid escaping Windows paths
@@ -188,9 +191,13 @@ def analyze(start, duration, tracks=0):
         bright = read("bright")
         motion = {k: [0.0] + [v / 2.55 for v in read(k)] for k in ("soft", "hard")}
         sound = []
-        if tracks:
+        if tracks:  # place each reading by its timestamp, not by counting
+            sound = [-120.0] * len(bright)
             with open(os.path.join(tmp, "sound.txt")) as f:
-                sound = [-120.0 if "inf" in v else float(v) for v in re.findall(r"RMS_level=(-?[\d.]+|-?inf)", f.read())]
+                for t, v in re.findall(r"pts_time:([\d.]+)\s+\S+RMS_level=(-?[\d.]+|-?inf)", f.read()):
+                    i = round(float(t) / STEP)
+                    if i < len(sound):
+                        sound[i] = -120.0 if "inf" in v else float(v)
     return bright, motion, sound
 
 
@@ -223,14 +230,17 @@ def plan_cuts(bright, motion, sound, duration, idle_mode):
             before = sorted(sound[max(0, i - round(1 / STEP)):i])
             if sound[i] >= typical and sound[i] - before[len(before) // 2] >= SOUND_RISE_DB:
                 first = max(0, i - round(SOUND_PREROLL / STEP))
-                k, limit = i - 1, max(0, i - round(SOUND_LOOKBACK / STEP))
+                active[first:i + 1] = [True] * (i + 1 - first)
+                # Also keep the movement that set it up (e.g. declaring the attacker: its border turns
+                # gold and it tilts forward), skipping any still pause in between.
+                k, limit = first - 1, max(0, i - round(SOUND_LOOKBACK / STEP))
                 while k > limit and soft[k] < 1.0:  # find the most recent movement...
                     k -= 1
-                while k > limit and soft[k - 1] >= 1.0:  # ...and where it began
-                    k -= 1
-                if soft[k] >= 1.0:
-                    first = min(first, k)
-                active[first:i + 1] = [True] * (i + 1 - first)
+                if k > limit:
+                    end = k
+                    while k > limit and max(soft[max(0, k - 3):k]) >= 1.0:  # ...and where it began,
+                        k -= 1                                               # bridging tiny pauses
+                    active[k:end + 1] = [True] * (end + 1 - k)
 
     if cfg["overlays"] and n:
         # Pop-up windows dim the whole board, so they show up as a clear drop in brightness.
@@ -268,7 +278,10 @@ def source_graph(ranges, tracks, with_audio=True):
     """Filter graph that stitches the kept ranges together.
     Returns (graph parts, video label, audio labels)."""
     if not ranges:
-        return [], "[0:v:0]", [f"[0:a:{j}]" for j in range(tracks)] if with_audio else []
+        if not with_audio:
+            return [], "[0:v:0]", []
+        return ([f"[0:a:{j}]{FILL_AUDIO_GAPS}[sa{j}]" for j in range(tracks)], "[0:v:0]",
+                [f"[sa{j}]" for j in range(tracks)])
     # Video streams through: drop frames outside the ranges and shift the rest back by however
     # much has been cut before them. (Trimming each piece separately makes ffmpeg hold every
     # later piece in memory, gigabytes at 1080p.)
@@ -283,7 +296,7 @@ def source_graph(ranges, tracks, with_audio=True):
     for k, (a, b) in enumerate(ranges):
         fade = min(0.02, (b - a) / 4)
         for j in range(tracks):
-            parts.append(f"[0:a:{j}]atrim={a:.3f}:{b:.3f},asetpts=PTS-STARTPTS,"
+            parts.append(f"[0:a:{j}]{FILL_AUDIO_GAPS},atrim={a:.3f}:{b:.3f},asetpts=PTS-STARTPTS,"
                          f"afade=d={fade:.3f},afade=t=out:st={b - a - fade:.3f}:d={fade:.3f}[a{k}_{j}]")
             order += f"[a{k}_{j}]"
     audio = [f"[ca{j}]" for j in range(tracks)]
