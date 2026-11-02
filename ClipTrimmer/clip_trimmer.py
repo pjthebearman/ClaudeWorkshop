@@ -28,7 +28,7 @@ FFPROBE = shutil.which("ffprobe")
 TOKEN = secrets.token_urlsafe(16)
 VIDEO_TYPES = {".mp4": "video/mp4", ".m4v": "video/mp4", ".mov": "video/mp4",
                ".mkv": "video/webm", ".webm": "video/webm"}
-DISCORD_LIMITS = {10: "10 MB (free)", 50: "50 MB (Nitro Basic)", 500: "500 MB (Nitro)"}
+DISCORD_LIMITS = {20: "20 MB (free)", 50: "50 MB (Nitro Basic)", 500: "500 MB (Nitro)"}
 
 state = {"path": None, "info": None, "version": 0}
 job = {"state": "idle", "progress": 0.0, "message": "", "output": None}
@@ -110,7 +110,7 @@ def export(mode, start, end, limit_mb):
 
     # Discord: two-pass encode aimed just under the upload limit.
     limit_bytes = limit_mb * 1000 * 1000
-    audio_k = 128 if limit_mb > 10 or duration < 40 else 96
+    audio_k = 128 if limit_mb > 20 or duration < 40 else 96
     if not tracks:
         audio_k = 0
     video_k = limit_bytes * 8 * 0.94 / duration / 1000 - audio_k
@@ -282,7 +282,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 start, end = float(body["start"]), float(body["end"])
                 mode = body["mode"]
-                limit = int(body.get("limit", 10))
+                limit = int(body.get("limit", 20))
             except (KeyError, TypeError, ValueError):
                 return self.send_json({"error": "Bad request"}, 400)
             duration = state["info"]["duration"]

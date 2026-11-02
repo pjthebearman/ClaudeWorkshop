@@ -33,9 +33,9 @@ Clips are saved next to the original, e.g. `Game 2026.11.02 - 20.15.33.01_3m12s-
 | Export | What you get |
 | --- | --- |
 | Original quality | Same resolution, frame rate and audio tracks, cut to the exact frame. Quick, but files are large. |
-| For Discord | Two-pass H.264 sized to fit 10 MB (free), 50 MB or 500 MB (Nitro). Drops to 720p/480p or 30 fps only when the budget is tight. If you record your mic on a separate track, it's mixed in, because Discord only plays the first audio track. |
+| For Discord | Two-pass H.264 sized to fit 20 MB (free), 50 MB or 500 MB (Nitro). Drops to 720p/480p or 30 fps only when the budget is tight. If you record your mic on a separate track, it's mixed in, because Discord only plays the first audio track. |
 
-A 30-second 1080p60 clip fits in 10 MB at 720p60.
+A 30-second 1080p60 clip fits in 20 MB at full 1080p60.
 
 ## Notes
 
