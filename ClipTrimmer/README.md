@@ -43,6 +43,23 @@ never overwritten; a `(2)` is added instead. Files that don't follow NVIDIA's
 naming go into `Clips/Other`. To save somewhere else, set the
 `CLIP_TRIMMER_FOLDER` environment variable to the folder you want.
 
+## Cutting idle time
+
+The drop-down next to the export buttons can remove pauses automatically. It's
+made for card games like MTG Arena, where a lot of a recording is thinking and
+reading. It works with either export button.
+
+| Option | What it cuts |
+| --- | --- |
+| Keep everything | Nothing. |
+| Cut idle time | Any stretch over a second where the screen is still, such as thinking or reading, leaving a short beat so cuts don't feel abrupt. |
+| Cut idle time - Aggressive | Also cuts mouse movement and hovering (heading for End Turn, reading a card), and shrinks pop-up windows such as Graveyard or Choose One to a quick flash as they open and close. A dark screen at the very end, such as Victory or Defeat, is kept. |
+
+It works by measuring how much of the screen changes ten times a second, so
+background shimmer and sparkle are ignored. On a 2:18 Arena game, *Cut idle
+time* gave 1:40 and *Aggressive* gave 1:00. The finished message says how much
+was cut. Background music jumps at each cut; a tiny fade stops clicks.
+
 | Export | What you get |
 | --- | --- |
 | Original quality | Same resolution, frame rate and audio tracks, cut to the exact frame. Quick, but files are large. |

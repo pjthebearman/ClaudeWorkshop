@@ -124,11 +124,11 @@ def unique_output(src, start, end, name, suffix):
     return out
 
 
-def run_ffmpeg(args, duration, lo, hi):
+def run_ffmpeg(args, duration, lo, hi, cwd=None):
     """Run ffmpeg, mapping its progress onto job['progress'] between lo and hi."""
     proc = subprocess.Popen([FFMPEG, "-hide_banner", "-v", "error", "-y", "-nostats",
                              "-progress", "pipe:1", *args],
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=cwd)
     for line in proc.stdout:
         m = re.match(r"out_time_(?:us|ms)=(\d+)", line)
         if m and duration > 0:
@@ -138,20 +138,165 @@ def run_ffmpeg(args, duration, lo, hi):
         raise RuntimeError(err.strip().splitlines()[-1] if err.strip() else "ffmpeg failed")
 
 
-def export(mode, start, end, limit_mb, name):
+# ---------------------------------------------------------------- idle-time detection
+#
+# Card games like MTG Arena are never perfectly still (ambient sparkle, glowing avatars),
+# but that shimmer touches well under 1% of the screen. Real actions (casting, resolving,
+# attacking) change much more. We sample a tiny greyscale copy 10 times a second and
+# measure how much of it changed; long low-change stretches are thinking/reading time.
+
+STEP = 0.1
+IDLE_MODES = {"off": "Keep everything", "normal": "Cut idle time", "aggressive": "Cut idle time - Aggressive"}
+IDLE_SETTINGS = {
+    # change: which motion measure counts as action and how much of the screen must change (%)
+    # min_gap: idle stretches shorter than this are kept; tail/lead: pause kept after/before action
+    "normal": dict(change="soft", active=1.0, min_gap=1.0, tail=0.35, lead=0.25, overlays=False),
+    # Ignores the cursor and button glows (stricter per-pixel test, more of the screen) and
+    # squeezes pop-up windows (Graveyard, Choose One...) down to a flash as they open and close.
+    "aggressive": dict(change="hard", active=3.0, min_gap=0.5, tail=0.25, lead=0.15, overlays=True),
+}
+MAX_PIECES = 50  # keeps the ffmpeg command comfortably under Windows' length limit
+
+
+def analyze(start, duration):
+    """Brightness and two motion measures (% of screen changed) for every STEP of the selection."""
+    def changed(label, threshold):
+        return (f"[{label}]tblend=all_mode=difference,lut=y='if(gt(val\\,{threshold})\\,255\\,0)',"
+                f"signalstats,metadata=print:key=lavfi.signalstats.YAVG:file={label}.txt[o{label}]")
+    graph = ";".join([
+        f"[0:v:0]fps={1 / STEP:g},scale=160:90,format=gray,split=3[bright][soft][hard]",
+        "[bright]signalstats,metadata=print:key=lavfi.signalstats.YAVG:file=bright.txt[obright]",
+        changed("soft", 18), changed("hard", 40)])
+    with tempfile.TemporaryDirectory() as tmp:  # relative file names avoid escaping Windows paths
+        outputs = [x for label in ("bright", "soft", "hard") for x in ("-map", f"[o{label}]", "-f", "null", "-")]
+        run_ffmpeg(["-ss", f"{start:.3f}", "-t", f"{duration:.3f}", "-i", str(state["path"]), "-an",
+                    "-filter_complex", graph, *outputs], duration, 0, 0.15, cwd=tmp)
+
+        def read(label):
+            with open(os.path.join(tmp, label + ".txt")) as f:
+                return [float(v) for v in re.findall(r"YAVG=([\d.]+)", f.read())]
+        bright = read("bright")
+        motion = {k: [0.0] + [v / 2.55 for v in read(k)] for k in ("soft", "hard")}
+    return bright, motion
+
+
+def runs(flags):
+    """(first, last+1) index pairs for each run of True values."""
+    out, i = [], 0
+    while i < len(flags):
+        if flags[i]:
+            j = i
+            while j < len(flags) and flags[j]:
+                j += 1
+            out.append((i, j))
+            i = j
+        else:
+            i += 1
+    return out
+
+
+def plan_cuts(bright, motion, duration, idle_mode):
+    """Ranges of the selection (in seconds from its start) to keep."""
+    cfg = IDLE_SETTINGS[idle_mode]
+    levels = motion[cfg["change"]]
+    n = min(len(levels), len(bright))
+    active = [levels[i] >= cfg["active"] for i in range(n)]
+
+    if cfg["overlays"] and n:
+        # Pop-up windows dim the whole board, so they show up as a clear drop in brightness.
+        typical = sorted(bright[:n])[n // 2]
+        dark = [b < typical * 0.75 for b in bright[:n]]
+        keep_edge = round(0.4 / STEP)
+        for i, j in runs(dark):
+            if j - i < round(0.5 / STEP):
+                continue  # a passing flash
+            if j >= n - 1:  # dark until the end: the Victory/Defeat screen, so keep all of it
+                active[i:j] = [True] * (j - i)
+                continue
+            for k in range(i, j):
+                active[k] = k < i + keep_edge or k >= j - keep_edge
+
+    gap, tail, lead = round(cfg["min_gap"] / STEP), round(cfg["tail"] / STEP), round(cfg["lead"] / STEP)
+    idle = [(i, j) for i, j in runs([not a for a in active]) if j - i >= gap]
+    if len(idle) >= MAX_PIECES:  # only cut the longest pauses
+        idle = sorted(sorted(idle, key=lambda r: r[1] - r[0])[-(MAX_PIECES - 1):])
+    keep, pos = [], 0
+    for i, j in idle:
+        a = i + (tail if i else 0)          # don't keep a pause before the very first action
+        b = j - (lead if j < n else 0)      # or after the very last one
+        if b > a:
+            if a > pos:
+                keep.append((pos, a))
+            pos = b
+    if pos < n:
+        keep.append((pos, n))
+    ranges = [(round(a * STEP, 3), round(min(b * STEP, duration), 3)) for a, b in keep]
+    return [(a, b) for a, b in ranges if b - a > 0.05]
+
+
+def source_graph(ranges, tracks, with_audio=True):
+    """Filter graph that stitches the kept ranges together.
+    Returns (graph parts, video label, audio labels)."""
+    if not ranges:
+        return [], "[0:v:0]", [f"[0:a:{j}]" for j in range(tracks)] if with_audio else []
+    # Video streams through: drop frames outside the ranges and shift the rest back by however
+    # much has been cut before them. (Trimming each piece separately makes ffmpeg hold every
+    # later piece in memory, gigabytes at 1080p.)
+    keep = "+".join(f"gte(t,{a:.3f})*lt(t,{b:.3f})" for a, b in ranges)
+    removed = f"{ranges[0][0]:.3f}" + "".join(
+        f"+gte(T,{a:.3f})*{a - prev_b:.3f}" for (_, prev_b), (a, _) in zip(ranges, ranges[1:]))
+    parts = [f"[0:v:0]select='{keep}',setpts='(T-({removed}))/TB'[cv]"]
+    if not with_audio:
+        return parts, "[cv]", []
+    # Audio is small, so it's cut into pieces with a tiny fade at each join to stop clicks.
+    order = ""
+    for k, (a, b) in enumerate(ranges):
+        fade = min(0.02, (b - a) / 4)
+        for j in range(tracks):
+            parts.append(f"[0:a:{j}]atrim={a:.3f}:{b:.3f},asetpts=PTS-STARTPTS,"
+                         f"afade=d={fade:.3f},afade=t=out:st={b - a - fade:.3f}:d={fade:.3f}[a{k}_{j}]")
+            order += f"[a{k}_{j}]"
+    audio = [f"[ca{j}]" for j in range(tracks)]
+    if tracks:
+        parts.append(f"{order}concat=n={len(ranges)}:v=0:a={tracks}{''.join(audio)}")
+    return parts, "[cv]", audio
+
+
+# ---------------------------------------------------------------- export
+
+def export(mode, start, end, limit_mb, name, idle_mode="off"):
     src, info = state["path"], state["info"]
     duration = end - start
-    seek = ["-ss", f"{start:.3f}", "-i", str(src), "-t", f"{duration:.3f}"]
+    seek = ["-ss", f"{start:.3f}", "-t", f"{duration:.3f}", "-i", str(src)]
     tracks = info["audio_tracks"]
+
+    ranges, lo, note = [], 0.0, ""
+    if idle_mode != "off":
+        job["message"] = "Finding idle time…"
+        ranges = plan_cuts(*analyze(start, duration), duration, idle_mode)
+        kept = sum(b - a for a, b in ranges)
+        if not ranges or duration - kept < 0.5:
+            ranges = []  # nothing worth cutting
+            note = ", no idle time found"
+        else:
+            note = f", cut {duration - kept:.0f}s of idle time"
+            duration = kept
+        lo = 0.15
 
     if mode == "original":
         out = unique_output(src, start, end, name, "")
         job["message"] = "Exporting at original quality…"
-        run_ffmpeg([*seek, "-map", "0:v:0", "-map", "0:a?",
-                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
+        parts, v, audio = source_graph(ranges, tracks)
+        parts.append(f"{v}format=yuv420p[ov]")
+        maps = ["-map", "[ov]"]
+        for j, a in enumerate(audio):
+            parts.append(f"{a}anull[oa{j}]")
+            maps += ["-map", f"[oa{j}]"]
+        run_ffmpeg([*seek, "-filter_complex", ";".join(parts), *maps,
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
                     "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(out)],
-                   duration, 0, 1)
-        return out
+                   duration, lo, 1)
+        return out, note
 
     # Discord: two-pass encode aimed just under the upload limit.
     limit_bytes = limit_mb * 1000 * 1000
@@ -162,6 +307,7 @@ def export(mode, start, end, limit_mb, name):
     if video_k < 150:
         raise ValueError(f"That selection is too long to fit in {limit_mb} MB. Shorten it or pick a larger limit.")
     out = unique_output(src, start, end, name, " - Discord")
+    mid = lo + (1 - lo) / 2
 
     with tempfile.TemporaryDirectory() as tmp:
         for attempt in range(3):
@@ -169,40 +315,41 @@ def export(mode, start, end, limit_mb, name):
             vf = f"scale=-2:'min(ih,{height})'"
             if (info["fps"] or 0) > 31 and video_k < 2000:
                 vf += ",fps=30"
-            # Discord only plays the first audio track, so NVIDIA's separate mic track gets mixed in.
-            vgraph = f"[0:v:0]{vf}[v]"
-            if tracks > 1:
-                mix = "".join(f"[0:a:{i}]" for i in range(tracks)) + f"amix=inputs={tracks}:normalize=0[a]"
-                audio = ["-filter_complex", f"{vgraph};{mix}", "-map", "[v]", "-map", "[a]"]
-            elif tracks == 1:
-                audio = ["-filter_complex", vgraph, "-map", "[v]", "-map", "0:a:0"]
-            else:
-                audio = ["-filter_complex", vgraph, "-map", "[v]", "-an"]
-            if tracks:
-                audio += ["-c:a", "aac", "-b:a", f"{audio_k}k"]
             video = ["-c:v", "libx264", "-preset", "medium", "-b:v", f"{int(video_k)}k",
                      "-pix_fmt", "yuv420p", "-passlogfile", os.path.join(tmp, "pass")]
             label = f"Compressing for Discord ({height}p, {int(video_k)} kbps)"
+
             job["message"] = label + ": pass 1 of 2…"
-            run_ffmpeg([*seek, "-filter_complex", vgraph, "-map", "[v]", *video, "-pass", "1", "-an",
-                        "-f", "mp4", os.devnull], duration, 0, 0.5)
+            parts, v, _ = source_graph(ranges, tracks, with_audio=False)
+            graph = ";".join([*parts, f"{v}{vf}[v]"])
+            run_ffmpeg([*seek, "-filter_complex", graph, "-map", "[v]", *video, "-pass", "1", "-an",
+                        "-f", "mp4", os.devnull], duration, lo, mid)
+
             job["message"] = label + ": pass 2 of 2…"
-            run_ffmpeg([*seek, *audio, *video, "-pass", "2", "-movflags", "+faststart", str(out)],
-                       duration, 0.5, 1)
+            parts, v, audio = source_graph(ranges, tracks)
+            parts.append(f"{v}{vf}[v]")
+            maps = ["-map", "[v]"]
+            if audio:
+                # Discord only plays the first audio track, so NVIDIA's separate mic track gets mixed in.
+                mix = f"amix=inputs={len(audio)}:normalize=0" if len(audio) > 1 else "anull"
+                parts.append(f"{''.join(audio)}{mix}[a]")
+                maps += ["-map", "[a]", "-c:a", "aac", "-b:a", f"{audio_k}k"]
+            run_ffmpeg([*seek, "-filter_complex", ";".join(parts), *maps, *video, "-pass", "2",
+                        "-movflags", "+faststart", str(out)], duration, mid, 1)
             size = out.stat().st_size
             if size <= limit_bytes:
-                return out
+                return out, note
             video_k *= limit_bytes / size * 0.93
             job["message"] = "Slightly over the limit, trying again smaller…"
     raise RuntimeError(f"Could not get the clip under {limit_mb} MB. Try a shorter selection.")
 
 
-def export_thread(mode, start, end, limit_mb, name):
+def export_thread(mode, start, end, limit_mb, name, idle_mode):
     try:
-        out = export(mode, start, end, limit_mb, name)
+        out, note = export(mode, start, end, limit_mb, name, idle_mode)
         size = out.stat().st_size / 1e6
         job.update(state="done", progress=1.0, output=str(out),
-                   message=f"Saved {out.parent.name}/{out.name} ({size:.1f} MB)")
+                   message=f"Saved {out.parent.name}/{out.name} ({size:.1f} MB{note})")
     except Exception as e:  # report anything back to the page
         job.update(state="error", message=str(e))
 
@@ -270,7 +417,7 @@ class Handler(BaseHTTPRequestHandler):
             path = state["path"]
             self.send_json({"name": path.name if path else None, "folder": str(path.parent) if path else None,
                             "version": state["version"], "info": state["info"], "job": job,
-                            "limits": DISCORD_LIMITS, "save_to": str(clips_folder(path)) if path else None})
+                            "limits": DISCORD_LIMITS, "idle_modes": IDLE_MODES, "save_to": str(clips_folder(path)) if path else None})
         else:
             self.send_error(404)
 
@@ -329,11 +476,12 @@ class Handler(BaseHTTPRequestHandler):
                 mode = body["mode"]
                 limit = int(body.get("limit", 20))
                 name = str(body.get("name", ""))
+                idle = body.get("idle", "off")
             except (KeyError, TypeError, ValueError):
                 return self.send_json({"error": "Bad request"}, 400)
             duration = state["info"]["duration"]
             start, end = max(0.0, start), min(end, duration) if duration else end
-            if mode not in ("original", "discord") or limit not in DISCORD_LIMITS:
+            if mode not in ("original", "discord") or limit not in DISCORD_LIMITS or idle not in IDLE_MODES:
                 return self.send_json({"error": "Unknown export option."}, 400)
             if end - start < 0.1:
                 return self.send_json({"error": "The end needs to be after the start."}, 400)
@@ -341,7 +489,7 @@ class Handler(BaseHTTPRequestHandler):
                 if job["state"] == "running":
                     return self.send_json({"error": "An export is already running."}, 409)
                 job.update(state="running", progress=0.0, message="Starting…", output=None)
-            threading.Thread(target=export_thread, args=(mode, start, end, limit, name), daemon=True).start()
+            threading.Thread(target=export_thread, args=(mode, start, end, limit, name, idle), daemon=True).start()
             self.send_json({"ok": True})
         elif url.path == "/api/open":
             if job["state"] == "running":
@@ -476,6 +624,7 @@ PAGE = r"""<!doctype html>
     <button class="main" id="exportOriginal">Export original quality</button>
     <button class="main" id="exportDiscord">Export for Discord</button>
     <select id="limit"></select>
+    <select id="idle" title="Automatically remove pauses where nothing happens"></select>
   </div>
 
   <div class="row" id="status" hidden>
@@ -534,6 +683,7 @@ async function load() {
     $('file').textContent = s.name + ' · ' + info.width + '×' + info.height + ' · ' + Math.round(info.fps) + ' fps' +
       (info.audio_tracks > 1 ? ' · ' + info.audio_tracks + ' audio tracks' : '');
     $('limit').innerHTML = Object.entries(s.limits).map(([mb, label]) => `<option value="${mb}">${label}</option>`).join('');
+    if (!$('idle').options.length) $('idle').innerHTML = Object.entries(s.idle_modes).map(([k, label]) => `<option value="${k}">${label}</option>`).join('');
     $('codec').hidden = true;
     $('name').value = '';
     $('saveTo').textContent = 'Saves to ' + s.save_to;
@@ -563,7 +713,7 @@ async function exportClip(mode) {
   if (end - start < 0.1) { $('error').textContent = 'The end needs to be after the start.'; return; }
   video.pause();
   try {
-    await api('/api/export', { mode, start, end, limit: Number($('limit').value), name: $('name').value });
+    await api('/api/export', { mode, start, end, limit: Number($('limit').value), name: $('name').value, idle: $('idle').value });
     showJob({ state: 'running', progress: 0, message: 'Starting…' });
   } catch (e) { $('error').textContent = e.message; }
 }
