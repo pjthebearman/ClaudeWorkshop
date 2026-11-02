@@ -38,7 +38,8 @@ progress readout) and works from a temporary copy, deleted when you move on.
 2. Press **I** / **O** (or the buttons) to set the start and end, or type times
    such as `3:12.5`. **30s before here** selects the 30 seconds before the playhead.
 3. **Play selection** to check it.
-4. Optionally type a **clip name**, like `Triple kill`, then export.
+4. Optionally type a **clip name**, like `Triple kill`, then export. You can
+   still change the name while it exports; the file is named when it finishes.
 
 Clips go into a `Clips` folder inside your Videos folder (created if needed),
 with a subfolder per game taken from NVIDIA's filename:

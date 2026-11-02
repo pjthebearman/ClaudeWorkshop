@@ -363,7 +363,9 @@ def source_graph(ranges, tracks, with_audio=True):
 
 # ---------------------------------------------------------------- export
 
-def export(mode, start, end, limit_mb, name, idle_mode="off"):
+def export(mode, start, end, limit_mb, idle_mode, out):
+    """Encode the selection into `out` (a temporary name; the final one is chosen when it's done).
+    Returns a note about idle time for the finished message."""
     src, info = state["path"], state["info"]
     duration = end - start
     seek = ["-ss", f"{start:.3f}", "-t", f"{duration:.3f}", "-i", str(src)]
@@ -383,7 +385,6 @@ def export(mode, start, end, limit_mb, name, idle_mode="off"):
         lo = 0.15
 
     if mode == "original":
-        out = unique_output(src, start, end, name, "")
         job["message"] = "Exporting at original quality…"
         parts, v, audio = source_graph(ranges, tracks)
         parts.append(f"{v}format=yuv420p[ov]")
@@ -395,7 +396,7 @@ def export(mode, start, end, limit_mb, name, idle_mode="off"):
                     "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
                     "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(out)],
                    duration, lo, 1)
-        return out, note
+        return note
 
     # Discord: two-pass encode aimed just under the upload limit.
     limit_bytes = limit_mb * 1000 * 1000
@@ -405,7 +406,6 @@ def export(mode, start, end, limit_mb, name, idle_mode="off"):
     video_k = limit_bytes * 8 * 0.94 / duration / 1000 - audio_k
     if video_k < 150:
         raise ValueError(f"That selection is too long to fit in {limit_mb} MB. Shorten it or pick a larger limit.")
-    out = unique_output(src, start, end, name, " - Discord")
     mid = lo + (1 - lo) / 2
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -437,19 +437,27 @@ def export(mode, start, end, limit_mb, name, idle_mode="off"):
                         "-movflags", "+faststart", str(out)], duration, mid, 1)
             size = out.stat().st_size
             if size <= limit_bytes:
-                return out, note
+                return note
             video_k *= limit_bytes / size * 0.93
             job["message"] = "Slightly over the limit, trying again smaller…"
     raise RuntimeError(f"Could not get the clip under {limit_mb} MB. Try a shorter selection.")
 
 
-def export_thread(mode, start, end, limit_mb, name, idle_mode):
+def export_thread(mode, start, end, limit_mb, idle_mode):
+    src = state["path"]
+    folder = clips_folder(src)
+    part = folder / f"~exporting {secrets.token_hex(3)}.mp4"
     try:
-        out, note = export(mode, start, end, limit_mb, name, idle_mode)
+        folder.mkdir(parents=True, exist_ok=True)
+        note = export(mode, start, end, limit_mb, idle_mode, part)
+        # The clip name can be changed while encoding, so it's only read now, at the very end.
+        out = unique_output(src, start, end, job.get("name", ""), " - Discord" if mode == "discord" else "")
+        os.replace(part, out)
         size = out.stat().st_size / 1e6
         job.update(state="done", progress=1.0, output=str(out),
                    message=f"Saved {out.parent.name}/{out.name} ({size:.1f} MB{note})")
     except Exception as e:  # report anything back to the page
+        remove_quietly(part)
         job.update(state="error", message=str(e))
 
 
@@ -618,8 +626,8 @@ class Handler(BaseHTTPRequestHandler):
             with job_lock:
                 if job["state"] == "running":
                     return self.send_json({"error": "An export is already running."}, 409)
-                job.update(state="running", progress=0.0, message="Starting…", output=None)
-            threading.Thread(target=export_thread, args=(mode, start, end, limit, name, idle), daemon=True).start()
+                job.update(state="running", progress=0.0, message="Starting…", output=None, name=name)
+            threading.Thread(target=export_thread, args=(mode, start, end, limit, idle), daemon=True).start()
             self.send_json({"ok": True})
         elif url.path == "/api/open":
             if job["state"] == "running":
@@ -633,6 +641,9 @@ class Handler(BaseHTTPRequestHandler):
         elif url.path == "/api/reveal":
             if job.get("output"):
                 reveal(job["output"])
+            self.send_json({"ok": True})
+        elif url.path == "/api/name":  # the clip name, edited while an export runs
+            job["name"] = str(body.get("name", ""))
             self.send_json({"ok": True})
         elif url.path == "/api/find":  # a clip dropped onto the page
             if job["state"] == "running":
@@ -915,7 +926,7 @@ function showJob(job) {
   $('status').hidden = job.state === 'idle' || job.state === 'error';
   $('progress').value = job.progress;
   $('progress').hidden = !running;
-  $('message').textContent = job.message;
+  $('message').textContent = job.message + (running ? ' You can still change the clip name.' : '');
   $('reveal').hidden = job.state !== 'done';
   $('error').textContent = job.state === 'error' ? job.message : '';
 }
@@ -960,6 +971,12 @@ for (const id of ['start', 'end']) {
     video.currentTime = id === 'start' ? start : end;
   });
 }
+// Name edits during an export are sent along; the file is named when it finishes.
+let nameTimer = null;
+$('name').addEventListener('input', () => {
+  clearTimeout(nameTimer);
+  nameTimer = setTimeout(() => api('/api/name', { name: $('name').value }).catch(() => {}), 250);
+});
 $('exportOriginal').onclick = () => exportClip('original');
 $('exportDiscord').onclick = () => exportClip('discord');
 $('reveal').onclick = () => api('/api/reveal', {});
