@@ -69,7 +69,58 @@ def probe(path):
 def load_file(path):
     path = Path(path).expanduser().resolve()
     info = probe(path)
+    previous = state["path"]
     state.update(path=path, info=info, version=state["version"] + 1)
+    if path.parent != UPLOADS:
+        state["folder"] = path.parent  # where your recordings are, for finding dropped clips
+    if previous and previous != path and previous.parent == UPLOADS:
+        remove_quietly(previous)  # a copied-in clip we've finished with
+
+
+# Clips dropped onto the page that couldn't be found on disk are copied here while they're open.
+UPLOADS = Path(tempfile.gettempdir()) / "clip_trimmer_uploads"
+
+
+def remove_quietly(path):
+    try:
+        path.unlink()
+    except OSError:
+        pass  # still in use (Windows) or already gone; cleared next time Clip Trimmer quits
+
+
+def find_on_disk(name, size):
+    """Browsers don't reveal where a dropped file lives, so look for one with the same name and size
+    in the usual places for recordings. Returns its path, or None."""
+    home = Path.home()
+    places = [(videos_folder(), 3), (home / "Videos", 3), (home / "Desktop", 1), (home / "Downloads", 1)]
+    if state.get("folder"):
+        places[:0] = [(state["folder"], 0), (state["folder"].parent, 2)]
+    seen, budget = set(), 100_000  # stop after this many folder entries, so it's never slow
+    for root, depth in places:
+        try:
+            root = root.resolve()
+        except OSError:
+            continue
+        if root in seen or root == UPLOADS or not root.is_dir():
+            continue
+        seen.add(root)
+        base = len(root.parts)
+        for folder, subfolders, files in os.walk(root):
+            budget -= len(files) + len(subfolders)
+            if budget < 0:
+                return None
+            if len(Path(folder).parts) - base >= depth:
+                subfolders[:] = []
+            else:
+                subfolders[:] = [d for d in subfolders if not d.startswith((".", "$"))]
+            if name in files:
+                candidate = Path(folder) / name
+                try:
+                    if candidate.stat().st_size == size:
+                        return candidate
+                except OSError:
+                    pass
+    return None
 
 
 # Recordings are named "<Game> <date> <time>", e.g. "World of Warcraft 2026-10-15 21-58-50" or
@@ -508,8 +559,38 @@ class Handler(BaseHTTPRequestHandler):
         except ConnectionError:
             pass  # the browser cancels requests all the time while seeking
 
+    def receive_upload(self, name):
+        """A dropped clip that wasn't found on disk: the page sends the file itself."""
+        name = clean_name(os.path.basename(name)) or "clip.mp4"
+        if job["state"] == "running":
+            return self.send_json({"error": "Wait for the export to finish."}, 409)
+        try:
+            remaining = int(self.headers.get("Content-Length") or 0)
+            UPLOADS.mkdir(parents=True, exist_ok=True)
+            target = UPLOADS / name
+            if state["path"] == target.resolve() and target.stat().st_size == remaining:
+                return self.send_json({"ok": True})  # dropped the same copied-in clip again
+            with open(target, "wb") as f:
+                while remaining > 0:
+                    chunk = self.rfile.read(min(1 << 20, remaining))
+                    if not chunk:
+                        raise ConnectionError("upload cut short")
+                    f.write(chunk)
+                    remaining -= len(chunk)
+            load_file(target)
+            job.update(state="idle", progress=0.0, message="", output=None)
+        except ConnectionError:
+            remove_quietly(UPLOADS / name)
+            return
+        except Exception as e:
+            return self.send_json({"error": f"Couldn't open that file: {e}"}, 400)
+        self.send_json({"ok": True})
+
     def do_POST(self):
         url = urlparse(self.path)
+        if url.path == "/api/upload" and self.authorized({}) and \
+                self.headers.get("Content-Type") == "application/octet-stream":
+            return self.receive_upload(parse_qs(url.query).get("name", [""])[0])
         if not self.authorized({}) or self.headers.get("Content-Type") != "application/json":
             return self.send_error(403)
         try:
@@ -553,6 +634,19 @@ class Handler(BaseHTTPRequestHandler):
             if job.get("output"):
                 reveal(job["output"])
             self.send_json({"ok": True})
+        elif url.path == "/api/find":  # a clip dropped onto the page
+            if job["state"] == "running":
+                return self.send_json({"error": "Wait for the export to finish."}, 409)
+            try:
+                found = find_on_disk(os.path.basename(str(body["name"])), int(body["size"]))
+                if found:
+                    load_file(found)
+                    job.update(state="idle", progress=0.0, message="", output=None)
+            except (KeyError, TypeError, ValueError):
+                return self.send_json({"error": "Bad request"}, 400)
+            except Exception as e:
+                return self.send_json({"error": f"Couldn't open that file: {e}"}, 400)
+            self.send_json({"found": bool(found)})
         elif url.path == "/api/load":  # from a second launch
             if job["state"] == "running":
                 return self.send_json({"error": "Clip Trimmer is busy exporting. Try again when it finishes."}, 409)
@@ -619,6 +713,7 @@ def main():
         input("Press Enter to close.")
         return 1
 
+    shutil.rmtree(UPLOADS, ignore_errors=True)  # copies left behind if it was closed unexpectedly
     try:
         load_file(path)
     except Exception as e:
@@ -663,6 +758,7 @@ def main():
         except (OSError, ValueError):
             pass
     server.shutdown()
+    shutil.rmtree(UPLOADS, ignore_errors=True)
     return 0
 
 
@@ -697,6 +793,7 @@ PAGE = r"""<!doctype html>
   .muted { color: var(--muted); }
   progress { width: 220px; }
   #error { color: #c0392b; }
+  body.dropping main { outline: 3px dashed var(--accent); outline-offset: -6px; }
   kbd { border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; font-size: .85em; }
 </style>
 </head>
@@ -740,7 +837,9 @@ PAGE = r"""<!doctype html>
     <button id="reveal" hidden>Show in folder</button>
   </div>
   <p id="error"></p>
-  <p class="muted">Keys: <kbd>Space</kbd> play/pause · <kbd>←</kbd>/<kbd>→</kbd> 1s (<kbd>Shift</kbd> 5s) · <kbd>,</kbd>/<kbd>.</kbd> one frame · <kbd>I</kbd>/<kbd>O</kbd> set start/end.</p>
+  <p id="notice" class="muted"></p>
+  <p class="muted">Keys: <kbd>Space</kbd> play/pause · <kbd>←</kbd>/<kbd>→</kbd> 1s (<kbd>Shift</kbd> 5s) · <kbd>,</kbd>/<kbd>.</kbd> one frame · <kbd>I</kbd>/<kbd>O</kbd> set start/end.
+  Drop a video anywhere on this page to open it.</p>
 </main>
 <script>
 const T = new URLSearchParams(location.search).get('t');
@@ -796,6 +895,7 @@ async function load() {
     $('saveTo').textContent = 'Saves to ' + s.save_to;
     document.title = s.name + ' · Clip Trimmer';
     lastJob = '';
+    $('notice').textContent = '';
     video.pause();
     video.src = '/video?t=' + encodeURIComponent(T) + '&v=' + version;
     start = Math.max(0, info.duration - 30); end = info.duration;
@@ -872,6 +972,57 @@ $('quit').onclick = async () => {
   await api('/api/quit', {}).catch(() => {});
   document.body.innerHTML = '<main><h1>Clip Trimmer closed</h1><p>You can close this tab.</p></main>';
 };
+
+// Dropping a video onto the page opens it. Without preventDefault the browser would navigate away to it.
+window.addEventListener('dragover', e => {
+  e.preventDefault();
+  if (e.dataTransfer.types.includes('Files')) document.body.classList.add('dropping');
+});
+window.addEventListener('dragleave', e => { if (!e.relatedTarget) document.body.classList.remove('dropping'); });
+window.addEventListener('drop', e => {
+  e.preventDefault();
+  document.body.classList.remove('dropping');
+  const file = e.dataTransfer.files[0];
+  if (file) openDropped(file);
+});
+
+async function openDropped(file) {
+  $('error').textContent = '';
+  if (!file.type.startsWith('video/') && !/\.(mp4|mkv|mov|m4v|webm)$/i.test(file.name)) {
+    $('error').textContent = file.name + " doesn't look like a video.";
+    return;
+  }
+  $('notice').textContent = 'Opening ' + file.name + '…';
+  try {
+    const found = (await api('/api/find', { name: file.name, size: file.size })).found;
+    if (!found) await upload(file);  // not in the usual folders, so the browser hands over a copy
+    await load();
+    $('notice').textContent = found ? '' : 'Working from a temporary copy of ' + file.name + '.';
+  } catch (e) {
+    $('notice').textContent = '';
+    $('error').textContent = e.message;
+  }
+}
+
+function upload(file) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();  // unlike fetch, reports upload progress
+    xhr.open('POST', '/api/upload?name=' + encodeURIComponent(file.name));
+    xhr.setRequestHeader('X-Token', T);
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+    xhr.upload.onprogress = e => {
+      if (e.lengthComputable) $('notice').textContent = 'Copying ' + file.name + '… ' + Math.round(e.loaded / e.total * 100) + '%';
+    };
+    xhr.onload = () => {
+      if (xhr.status < 300) return resolve();
+      let message = 'Copying the file failed.';
+      try { message = JSON.parse(xhr.responseText).error || message; } catch (e) {}
+      reject(new Error(message));
+    };
+    xhr.onerror = () => reject(new Error('Copying the file failed.'));
+    xhr.send(file);
+  });
+}
 
 document.addEventListener('keydown', e => {
   if (e.target.matches('input, select') || e.ctrlKey || e.metaKey || e.altKey) return;

@@ -27,6 +27,12 @@ another…**). If Clip Trimmer is already running, it hands the clip over and
 closes straight away, and the open tab switches to it within a second. If
 you'd closed the tab, a new one opens.
 
+You can also drop a video straight onto the Clip Trimmer page. Browsers don't
+tell pages where a dropped file is, so Clip Trimmer looks for one with the
+same name and size near your last clip and in Videos, Desktop and Downloads,
+and opens it in place. If it isn't there, the page copies it in (with a
+progress readout) and works from a temporary copy, deleted when you move on.
+
 1. Scrub to the moment. The selection starts as the last 30 seconds, since
    that's usually where the replay moment is.
 2. Press **I** / **O** (or the buttons) to set the start and end, or type times
