@@ -56,8 +56,10 @@ reading. It works with either export button.
 | Cut idle time - Aggressive | Also cuts mouse movement and hovering (heading for End Turn, reading a card), and shrinks pop-up windows such as Graveyard or Choose One to a quick flash as they open and close. A dark screen at the very end, such as Victory or Defeat, is kept. |
 
 It works by measuring how much of the screen changes ten times a second, so
-background shimmer and sparkle are ignored. On a 2:18 Arena game, *Cut idle
-time* gave 1:40 and *Aggressive* gave 1:00. The finished message says how much
+background shimmer and sparkle are ignored. Sudden game sounds count as action
+too: an attack's sound keeps the attacker moving forward just before it. Only
+the first audio track is used, so a separate mic track doesn't count. On a
+2:18 Arena game, *Cut idle time* gave 1:42 and *Aggressive* gave 1:09. The finished message says how much
 was cut. Background music jumps at each cut; a tiny fade stops clicks.
 
 | Export | What you get |

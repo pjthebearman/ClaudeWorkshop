@@ -155,11 +155,16 @@ IDLE_SETTINGS = {
     # squeezes pop-up windows (Graveyard, Choose One...) down to a flash as they open and close.
     "aggressive": dict(change="hard", active=3.0, min_gap=0.5, tail=0.25, lead=0.15, overlays=True),
 }
+# Game sound effects (an attack, a spell landing, a turn banner) are sudden jumps in volume over
+# the quiet music, so a jump this big above the previous second also counts as action, along with a
+# little time before it to show what caused the sound: back to the start of the last visible movement
+# (e.g. the attacker tilting forward), searching up to SOUND_LOOKBACK seconds.
+SOUND_RISE_DB, SOUND_PREROLL, SOUND_LOOKBACK = 12, 0.6, 1.5
 MAX_PIECES = 50  # keeps the ffmpeg command comfortably under Windows' length limit
 
 
-def analyze(start, duration):
-    """Brightness and two motion measures (% of screen changed) for every STEP of the selection."""
+def analyze(start, duration, tracks=0):
+    """Brightness, two motion measures (% of screen changed) and game volume (dB) for every STEP."""
     def changed(label, threshold):
         return (f"[{label}]tblend=all_mode=difference,lut=y='if(gt(val\\,{threshold})\\,255\\,0)',"
                 f"signalstats,metadata=print:key=lavfi.signalstats.YAVG:file={label}.txt[o{label}]")
@@ -167,9 +172,14 @@ def analyze(start, duration):
         f"[0:v:0]fps={1 / STEP:g},scale=160:90,format=gray,split=3[bright][soft][hard]",
         "[bright]signalstats,metadata=print:key=lavfi.signalstats.YAVG:file=bright.txt[obright]",
         changed("soft", 18), changed("hard", 40)])
+    labels = ["bright", "soft", "hard"]
+    if tracks:  # first track only: it's the game; a second NVIDIA track is your mic
+        graph += (f";[0:a:0]aresample=16000,asetnsamples={int(16000 * STEP)},astats=metadata=1:reset=1,"
+                  "ametadata=print:key=lavfi.astats.Overall.RMS_level:file=sound.txt[osound]")
+        labels.append("sound")
     with tempfile.TemporaryDirectory() as tmp:  # relative file names avoid escaping Windows paths
-        outputs = [x for label in ("bright", "soft", "hard") for x in ("-map", f"[o{label}]", "-f", "null", "-")]
-        run_ffmpeg(["-ss", f"{start:.3f}", "-t", f"{duration:.3f}", "-i", str(state["path"]), "-an",
+        outputs = [x for label in labels for x in ("-map", f"[o{label}]", "-f", "null", "-")]
+        run_ffmpeg(["-ss", f"{start:.3f}", "-t", f"{duration:.3f}", "-i", str(state["path"]),
                     "-filter_complex", graph, *outputs], duration, 0, 0.15, cwd=tmp)
 
         def read(label):
@@ -177,7 +187,11 @@ def analyze(start, duration):
                 return [float(v) for v in re.findall(r"YAVG=([\d.]+)", f.read())]
         bright = read("bright")
         motion = {k: [0.0] + [v / 2.55 for v in read(k)] for k in ("soft", "hard")}
-    return bright, motion
+        sound = []
+        if tracks:
+            with open(os.path.join(tmp, "sound.txt")) as f:
+                sound = [-120.0 if "inf" in v else float(v) for v in re.findall(r"RMS_level=(-?[\d.]+|-?inf)", f.read())]
+    return bright, motion, sound
 
 
 def runs(flags):
@@ -195,12 +209,28 @@ def runs(flags):
     return out
 
 
-def plan_cuts(bright, motion, duration, idle_mode):
+def plan_cuts(bright, motion, sound, duration, idle_mode):
     """Ranges of the selection (in seconds from its start) to keep."""
     cfg = IDLE_SETTINGS[idle_mode]
     levels = motion[cfg["change"]]
     n = min(len(levels), len(bright))
     active = [levels[i] >= cfg["active"] for i in range(n)]
+
+    if sound:
+        typical = sorted(sound)[len(sound) // 2]
+        soft = motion["soft"]
+        for i in range(1, min(n, len(sound))):
+            before = sorted(sound[max(0, i - round(1 / STEP)):i])
+            if sound[i] >= typical and sound[i] - before[len(before) // 2] >= SOUND_RISE_DB:
+                first = max(0, i - round(SOUND_PREROLL / STEP))
+                k, limit = i - 1, max(0, i - round(SOUND_LOOKBACK / STEP))
+                while k > limit and soft[k] < 1.0:  # find the most recent movement...
+                    k -= 1
+                while k > limit and soft[k - 1] >= 1.0:  # ...and where it began
+                    k -= 1
+                if soft[k] >= 1.0:
+                    first = min(first, k)
+                active[first:i + 1] = [True] * (i + 1 - first)
 
     if cfg["overlays"] and n:
         # Pop-up windows dim the whole board, so they show up as a clear drop in brightness.
@@ -273,7 +303,7 @@ def export(mode, start, end, limit_mb, name, idle_mode="off"):
     ranges, lo, note = [], 0.0, ""
     if idle_mode != "off":
         job["message"] = "Finding idle time…"
-        ranges = plan_cuts(*analyze(start, duration), duration, idle_mode)
+        ranges = plan_cuts(*analyze(start, duration, tracks), duration, idle_mode)
         kept = sum(b - a for a, b in ranges)
         if not ranges or duration - kept < 0.5:
             ranges = []  # nothing worth cutting
