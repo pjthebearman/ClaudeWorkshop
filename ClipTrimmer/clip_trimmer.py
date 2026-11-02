@@ -67,14 +67,55 @@ def load_file(path):
     state.update(path=path, info=info, version=state["version"] + 1)
 
 
-def unique_output(src, start, end, suffix):
+# NVIDIA names recordings "<Game> 2026.11.02 - 20.15.33.01.mp4" (older versions put the date as 11.02.2026).
+NVIDIA_NAME = re.compile(r"^(?P<game>.+?)\s+\d{2,4}\.\d{2}\.\d{2,4}\s*-\s*\d{2}\.\d{2}\.\d{2}")
+RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+
+
+def clean_name(text):
+    """Make text safe to use as a file or folder name on Windows, macOS and Linux."""
+    text = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", str(text))
+    text = re.sub(r"\s+", " ", text).strip(" .")[:120].strip(" .")
+    return text + "_" if text.upper() in RESERVED else text
+
+
+def game_name(src):
+    m = NVIDIA_NAME.match(src.stem)
+    return (clean_name(m.group("game")) if m else "") or "Other"
+
+
+def videos_folder():
+    if sys.platform == "win32":
+        try:  # the real Videos folder, which may have been moved (e.g. into OneDrive)
+            import ctypes
+            import uuid
+            guid = ctypes.create_string_buffer(uuid.UUID("18989B1D-99B5-455B-841C-AB7C74E4DDFC").bytes_le, 16)
+            found = ctypes.c_wchar_p()
+            if ctypes.windll.shell32.SHGetKnownFolderPath(guid, 0, None, ctypes.byref(found)) == 0:
+                path = found.value
+                ctypes.windll.ole32.CoTaskMemFree(found)
+                return Path(path)
+        except Exception:
+            pass
+    folder = Path.home() / ("Movies" if sys.platform == "darwin" else "Videos")
+    return folder if folder.is_dir() else Path.home()
+
+
+def clips_folder(src):
+    root = os.environ.get("CLIP_TRIMMER_FOLDER")
+    return (Path(root).expanduser() if root else videos_folder() / "Clips") / game_name(src)
+
+
+def unique_output(src, start, end, name, suffix):
     def stamp(t):
         return f"{int(t // 60)}m{int(t % 60):02d}s"
+    folder = clips_folder(src)
+    folder.mkdir(parents=True, exist_ok=True)
     # Build names as plain strings: NVIDIA names like "Game 2026.11.02 - 20.15.33.01" are full of dots.
-    base = f"{src.stem}_{stamp(start)}-{stamp(end)}{suffix}"
-    out, n = src.with_name(base + ".mp4"), 2
+    base = (clean_name(name) or f"{src.stem}_{stamp(start)}-{stamp(end)}") + suffix
+    out, n = folder / (base + ".mp4"), 2
     while out.exists():
-        out = src.with_name(f"{base} ({n}).mp4")
+        out = folder / f"{base} ({n}).mp4"
         n += 1
     return out
 
@@ -93,14 +134,14 @@ def run_ffmpeg(args, duration, lo, hi):
         raise RuntimeError(err.strip().splitlines()[-1] if err.strip() else "ffmpeg failed")
 
 
-def export(mode, start, end, limit_mb):
+def export(mode, start, end, limit_mb, name):
     src, info = state["path"], state["info"]
     duration = end - start
     seek = ["-ss", f"{start:.3f}", "-i", str(src), "-t", f"{duration:.3f}"]
     tracks = info["audio_tracks"]
 
     if mode == "original":
-        out = unique_output(src, start, end, "")
+        out = unique_output(src, start, end, name, "")
         job["message"] = "Exporting at original quality…"
         run_ffmpeg([*seek, "-map", "0:v:0", "-map", "0:a?",
                     "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
@@ -116,7 +157,7 @@ def export(mode, start, end, limit_mb):
     video_k = limit_bytes * 8 * 0.94 / duration / 1000 - audio_k
     if video_k < 150:
         raise ValueError(f"That selection is too long to fit in {limit_mb} MB. Shorten it or pick a larger limit.")
-    out = unique_output(src, start, end, "_discord")
+    out = unique_output(src, start, end, name, " - Discord")
 
     with tempfile.TemporaryDirectory() as tmp:
         for attempt in range(3):
@@ -152,12 +193,12 @@ def export(mode, start, end, limit_mb):
     raise RuntimeError(f"Could not get the clip under {limit_mb} MB. Try a shorter selection.")
 
 
-def export_thread(mode, start, end, limit_mb):
+def export_thread(mode, start, end, limit_mb, name):
     try:
-        out = export(mode, start, end, limit_mb)
+        out = export(mode, start, end, limit_mb, name)
         size = out.stat().st_size / 1e6
         job.update(state="done", progress=1.0, output=str(out),
-                   message=f"Saved {out.name} ({size:.1f} MB)")
+                   message=f"Saved {out.parent.name}/{out.name} ({size:.1f} MB)")
     except Exception as e:  # report anything back to the page
         job.update(state="error", message=str(e))
 
@@ -225,7 +266,7 @@ class Handler(BaseHTTPRequestHandler):
             path = state["path"]
             self.send_json({"name": path.name if path else None, "folder": str(path.parent) if path else None,
                             "version": state["version"], "info": state["info"], "job": job,
-                            "limits": DISCORD_LIMITS})
+                            "limits": DISCORD_LIMITS, "save_to": str(clips_folder(path)) if path else None})
         else:
             self.send_error(404)
 
@@ -283,6 +324,7 @@ class Handler(BaseHTTPRequestHandler):
                 start, end = float(body["start"]), float(body["end"])
                 mode = body["mode"]
                 limit = int(body.get("limit", 20))
+                name = str(body.get("name", ""))
             except (KeyError, TypeError, ValueError):
                 return self.send_json({"error": "Bad request"}, 400)
             duration = state["info"]["duration"]
@@ -295,7 +337,7 @@ class Handler(BaseHTTPRequestHandler):
                 if job["state"] == "running":
                     return self.send_json({"error": "An export is already running."}, 409)
                 job.update(state="running", progress=0.0, message="Starting…", output=None)
-            threading.Thread(target=export_thread, args=(mode, start, end, limit), daemon=True).start()
+            threading.Thread(target=export_thread, args=(mode, start, end, limit, name), daemon=True).start()
             self.send_json({"ok": True})
         elif url.path == "/api/open":
             if job["state"] == "running":
@@ -388,6 +430,7 @@ PAGE = r"""<!doctype html>
   label { display: flex; gap: 6px; align-items: center; }
   input, select, button { font: inherit; color: inherit; background: transparent; border: 1px solid var(--line); border-radius: 4px; padding: 5px 9px; }
   input { width: 7.5em; }
+  input.wide { width: 22em; max-width: 60vw; }
   button { cursor: pointer; }
   button:hover { border-color: var(--accent); }
   button.main { background: var(--accent); color: var(--bg); border-color: var(--accent); }
@@ -421,6 +464,11 @@ PAGE = r"""<!doctype html>
   </div>
 
   <div class="row">
+    <label>Clip name <input id="name" class="wide" maxlength="120" placeholder="e.g. Triple kill (optional)"></label>
+    <span id="saveTo" class="muted"></span>
+  </div>
+
+  <div class="row">
     <button class="main" id="exportOriginal">Export original quality</button>
     <button class="main" id="exportDiscord">Export for Discord</button>
     <select id="limit"></select>
@@ -432,8 +480,7 @@ PAGE = r"""<!doctype html>
     <button id="reveal" hidden>Show in folder</button>
   </div>
   <p id="error"></p>
-  <p class="muted">Keys: <kbd>Space</kbd> play/pause · <kbd>←</kbd>/<kbd>→</kbd> 1s (<kbd>Shift</kbd> 5s) · <kbd>,</kbd>/<kbd>.</kbd> one frame · <kbd>I</kbd>/<kbd>O</kbd> set start/end.
-  Clips are saved next to the original.</p>
+  <p class="muted">Keys: <kbd>Space</kbd> play/pause · <kbd>←</kbd>/<kbd>→</kbd> 1s (<kbd>Shift</kbd> 5s) · <kbd>,</kbd>/<kbd>.</kbd> one frame · <kbd>I</kbd>/<kbd>O</kbd> set start/end.</p>
 </main>
 <script>
 const T = new URLSearchParams(location.search).get('t');
@@ -484,6 +531,8 @@ async function load() {
       (info.audio_tracks > 1 ? ' · ' + info.audio_tracks + ' audio tracks' : '');
     $('limit').innerHTML = Object.entries(s.limits).map(([mb, label]) => `<option value="${mb}">${label}</option>`).join('');
     $('codec').hidden = true;
+    $('name').value = '';
+    $('saveTo').textContent = 'Saves to ' + s.save_to;
     video.src = '/video?t=' + encodeURIComponent(T) + '&v=' + version;
     start = Math.max(0, info.duration - 30); end = info.duration;
     render();
@@ -510,7 +559,7 @@ async function exportClip(mode) {
   if (end - start < 0.1) { $('error').textContent = 'The end needs to be after the start.'; return; }
   video.pause();
   try {
-    await api('/api/export', { mode, start, end, limit: Number($('limit').value) });
+    await api('/api/export', { mode, start, end, limit: Number($('limit').value), name: $('name').value });
     showJob({ state: 'running', progress: 0, message: 'Starting…' });
   } catch (e) { $('error').textContent = e.message; }
 }

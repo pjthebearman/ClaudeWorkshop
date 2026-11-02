@@ -26,9 +26,22 @@ you work; closing it (or pressing **Quit**) stops the tool.
    that's usually where the replay moment is.
 2. Press **I** / **O** (or the buttons) to set the start and end, or type times
    such as `3:12.5`. **30s before here** selects the 30 seconds before the playhead.
-3. **Play selection** to check it, then export.
+3. **Play selection** to check it.
+4. Optionally type a **clip name**, like `Triple kill`, then export.
 
-Clips are saved next to the original, e.g. `Game 2026.11.02 - 20.15.33.01_3m12s-3m42s.mp4`.
+Clips go into a `Clips` folder inside your Videos folder (created if needed),
+with a subfolder per game taken from NVIDIA's filename:
+
+```
+Videos/Clips/Apex Legends/Triple kill.mp4
+Videos/Clips/Apex Legends/Triple kill - Discord.mp4
+```
+
+With no name, the clip is named after the recording and the times, e.g.
+`Apex Legends 2026.11.02 - 20.15.33.01_3m12s-3m42s.mp4`. Existing files are
+never overwritten; a `(2)` is added instead. Files that don't follow NVIDIA's
+naming go into `Clips/Other`. To save somewhere else, set the
+`CLIP_TRIMMER_FOLDER` environment variable to the folder you want.
 
 | Export | What you get |
 | --- | --- |
