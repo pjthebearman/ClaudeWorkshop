@@ -4,10 +4,29 @@ A background helper that turns play sessions into organised clips with little
 or no manual work. It drives OBS (see [OBS_SETUP.md](OBS_SETUP.md)), listens
 to game events, and hands recordings to Clip Trimmer's engine.
 
+## Running it
+
+1. Set OBS up as in [OBS_SETUP.md](OBS_SETUP.md) and leave OBS open.
+2. Double-click **Clip Agent.bat** (or run `python clip_agent.py`).
+3. The first time, paste the OBS WebSocket password when asked. It's stored
+   in Windows Credential Manager as `ClipAgent/OBS` (run with `--forget` to
+   remove it).
+
+The agent keeps OBS's replay buffer running. Each time you press your Save
+Replay hotkey, the replay is converted to MP4 (no quality loss, all audio
+tracks kept) and filed by the game in front at the time:
+
+```
+Videos\Captures\Magic The Gathering Arena\Magic The Gathering Arena 2026-11-03 21-14-07.mp4
+```
+
+Raw captures live in `Captures`; finished clips from Clip Trimmer go to
+`Clips`. If OBS is closed, the agent waits and reconnects when it's back.
+
 ## Plan
 
 1. **Capture:** OBS with a 5-minute replay buffer and game/mic/voice-chat
-   audio on separate tracks. *(set up)*
+   audio on separate tracks; saved replays filed automatically. *(done)*
 2. **MTG Arena matches:** read Arena's log (`Player.log`, Detailed Logs on);
    start recording when a match starts and stop when it ends; name the file
    with date, opponent and result; save a timeline of match events beside it;
