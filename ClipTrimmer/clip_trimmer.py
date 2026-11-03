@@ -70,7 +70,7 @@ def load_file(path):
     path = Path(path).expanduser().resolve()
     info = probe(path)
     previous = state["path"]
-    state.update(path=path, info=info, version=state["version"] + 1)
+    state.update(path=path, info=info, version=state["version"] + 1, must_keep=[])
     if path.parent != UPLOADS:
         state["folder"] = path.parent  # where your recordings are, for finding dropped clips
     if previous and previous != path and previous.parent == UPLOADS:
@@ -182,9 +182,15 @@ def unique_output(src, start, end, name, suffix):
 
 def run_ffmpeg(args, duration, lo, hi, cwd=None):
     """Run ffmpeg, mapping its progress onto job['progress'] between lo and hi."""
+    low = {}
+    if state.get("background"):  # exports for the Clip Agent run while you play: let the game come first
+        if sys.platform == "win32":
+            low["creationflags"] = 0x00004000  # BELOW_NORMAL_PRIORITY_CLASS
+        else:
+            low["preexec_fn"] = lambda: os.nice(10)
     proc = subprocess.Popen([FFMPEG, "-hide_banner", "-v", "error", "-y", "-nostats",
                              "-progress", "pipe:1", *args],
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=cwd)
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=cwd, **low)
     for line in proc.stdout:
         m = re.match(r"out_time_(?:us|ms)=(\d+)", line)
         if m and duration > 0:
@@ -272,7 +278,7 @@ def runs(flags):
     return out
 
 
-def plan_cuts(bright, motion, sound, duration, idle_mode):
+def plan_cuts(bright, motion, sound, duration, idle_mode, must_keep=()):
     """Ranges of the selection (in seconds from its start) to keep."""
     cfg = IDLE_SETTINGS[idle_mode]
     levels = motion[cfg["change"]]
@@ -311,6 +317,11 @@ def plan_cuts(bright, motion, sound, duration, idle_mode):
                 continue
             for k in range(i, j):
                 active[k] = k < i + keep_edge or k >= j - keep_edge
+
+    for a, b in must_keep:  # moments a game log says matter (seconds into the selection)
+        i, j = max(0, int(a / STEP)), min(n, int(b / STEP) + 1)
+        if j > i:
+            active[i:j] = [True] * (j - i)
 
     gap, tail, lead = round(cfg["min_gap"] / STEP), round(cfg["tail"] / STEP), round(cfg["lead"] / STEP)
     idle = [(i, j) for i, j in runs([not a for a in active]) if j - i >= gap]
@@ -374,7 +385,8 @@ def export(mode, start, end, limit_mb, idle_mode, out):
     ranges, lo, note = [], 0.0, ""
     if idle_mode != "off":
         job["message"] = "Finding idle time…"
-        ranges = plan_cuts(*analyze(start, duration, tracks), duration, idle_mode)
+        keep = [(a - start, b - start) for a, b in state.get("must_keep", []) if b > start and a < end]
+        ranges = plan_cuts(*analyze(start, duration, tracks), duration, idle_mode, keep)
         kept = sum(b - a for a, b in ranges)
         if not ranges or duration - kept < 0.5:
             ranges = []  # nothing worth cutting
@@ -441,6 +453,22 @@ def export(mode, start, end, limit_mb, idle_mode, out):
             video_k *= limit_bytes / size * 0.93
             job["message"] = "Slightly over the limit, trying again smaller…"
     raise RuntimeError(f"Could not get the clip under {limit_mb} MB. Try a shorter selection.")
+
+
+def export_clip(src, mode="original", idle_mode="aggressive", name="", start=0.0, end=None, limit_mb=20,
+                must_keep=()):
+    """For other tools (e.g. the Clip Agent): export without the page. `must_keep` lists
+    (start, end) seconds that idle-time cutting must never remove. Returns (path, message)."""
+    if job["state"] == "running":
+        raise RuntimeError("An export is already running.")
+    load_file(src)
+    state["must_keep"] = list(must_keep)
+    state["background"] = True
+    job.update(state="running", progress=0.0, message="", output=None, name=name)
+    export_thread(mode, start, end if end is not None else state["info"]["duration"], limit_mb, idle_mode)
+    if job["state"] != "done":
+        raise RuntimeError(job["message"])
+    return Path(job["output"]), job["message"]
 
 
 def export_thread(mode, start, end, limit_mb, idle_mode):

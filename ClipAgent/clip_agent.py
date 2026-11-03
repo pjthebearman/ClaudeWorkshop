@@ -4,8 +4,9 @@
     python clip_agent.py            run (keep this window open)
     python clip_agent.py --forget   forget the saved OBS password
 
-v1: keeps OBS's replay buffer running and, each time you save a replay, converts it
-to MP4 and files it under Videos/Captures/<Game>/ named after the game you were playing.
+Keeps OBS's replay buffer running and files each saved replay under Videos/Captures/<Game>/.
+Records every MTG Arena match (start to finish, from Arena's log), names it with the opponent
+and result, saves the match's event timeline beside it, and makes a trimmed copy in Clips.
 Needs Python 3.8+, ffmpeg on PATH, and OBS's WebSocket server enabled (see OBS_SETUP.md).
 """
 import base64
@@ -308,12 +309,12 @@ def game_for(program):
     return Path(program).stem or "Other"
 
 
-def file_capture(source, game, when):
+def file_capture(source, game, when, label=""):
     """Convert an OBS capture to MP4 (no re-encode, all tracks) and file it under Captures/<game>/."""
     source = Path(source)
     folder = captures_folder() / game
     folder.mkdir(parents=True, exist_ok=True)
-    base = f"{game} {when:%Y-%m-%d %H-%M-%S}"
+    base = f"{game} {when:%Y-%m-%d %H-%M-%S}" + (f" {safe_name(label)}" if label else "")
     target, n = folder / f"{base}.mp4", 2
     while target.exists():
         target, n = folder / f"{base} ({n}).mp4", n + 1
@@ -335,29 +336,148 @@ def file_capture(source, game, when):
 
 # ---------------------------------------------------------------- main loop
 
+# ---------------------------------------------------------------- MTG Arena matches
+
+ARENA = "Magic The Gathering Arena"
+
+# MTGA profile: moments the game log marks as worth seeing, as (seconds before, seconds after).
+# Idle-time cutting (aggressive) never removes these; it decides everything else.
+MTGA_KEEP = {
+    "castspell": (0.6, 2.0), "attack": (0.8, 2.5), "damage": (0.5, 1.5), "life": (0.3, 1.2),
+    "destroy": (0.3, 1.5), "sacrifice": (0.3, 1.5), "exile": (0.3, 1.5), "countered": (0.3, 1.5),
+    "turn": (0.0, 1.5), "game_over": (1.0, 6.0),
+}
+STOP_AFTER_MATCH = 5  # seconds of the Victory/Defeat screen to keep
+
+
+def safe_name(text):
+    return "".join(c for c in str(text) if c not in '<>:"/\\|?*' and ord(c) >= 32).strip(" .")
+
+
+def trimmer():
+    """Clip Trimmer's engine, from the ClipTrimmer folder next to this one."""
+    folder = Path(__file__).resolve().parent.parent / "ClipTrimmer"
+    if str(folder) not in sys.path:
+        sys.path.insert(0, str(folder))
+    import clip_trimmer
+    return clip_trimmer
+
+
 class Agent:
     def __init__(self):
         self.work = queue.Queue()  # filing happens off the connection thread
+        self.obs = None
+        self.recording = None      # the match being recorded: {"match":…, "started": epoch seconds}
+        self.record_started = threading.Event()
+        self.record_stopped = queue.Queue()
+        self.stop_now = threading.Event()   # cuts the post-match wait short when a new match starts
+        self.record_lock = threading.Lock()
 
+    # --- OBS events
     def on_event(self, kind, data):
         if kind == "ReplayBufferSaved":
             program = foreground_program()
-            self.work.put((data["savedReplayPath"], game_for(program), datetime.now()))
+            self.work.put(("replay", data["savedReplayPath"], game_for(program), datetime.now()))
         elif kind == "ReplayBufferStateChanged" and data.get("outputState") == "OBS_WEBSOCKET_OUTPUT_STOPPED":
             log("Replay buffer was stopped in OBS; it will be restarted.")
             self.restart_buffer = True
+        elif kind == "RecordStateChanged":
+            if data.get("outputState") == "OBS_WEBSOCKET_OUTPUT_STARTED":
+                if self.recording and not self.recording.get("started"):
+                    self.recording["started"] = time.time()
+                self.record_started.set()
+            elif data.get("outputState") == "OBS_WEBSOCKET_OUTPUT_STOPPED":
+                self.record_stopped.put(data.get("outputPath"))
+
+    # --- Arena log events
+    def match_started(self, match):
+        if self.recording:  # previous match still open (its end screen, or its end never logged)
+            self.stop_now.set()
+            self.finish_recording(wait=False)
+        obs = self.obs
+        if not obs or obs.closed.is_set():
+            log(f"Arena match vs {match['opponent']} started, but OBS isn't connected, so it won't be recorded.")
+            return
+        try:
+            if obs.request("GetRecordStatus")["outputActive"]:
+                log(f"Arena match vs {match['opponent']} started; OBS is already recording, so leaving it alone.")
+                return
+            self.record_started.clear()
+            self.recording = {"match": match, "started": None}
+            obs.request("StartRecord")
+            if not self.record_started.wait(10):
+                self.recording["started"] = time.time()
+            log(f"Recording Arena match vs {match['opponent']}…")
+        except (OBSError, ConnectionError) as e:
+            self.recording = None
+            log(f"Couldn't start recording the match: {e}")
+
+    def match_ended(self, match):
+        recording = self.recording
+        if not recording or recording["match"] is not match:
+            return
+        log(f"Match over: {match['result'] or 'no result'} vs {match['opponent']}. Stopping in {STOP_AFTER_MATCH}s…")
+        self.stop_now.clear()
+        self.finish_recording(wait=True)
+
+    def finish_recording(self, wait):
+        recording = self.recording
+        if wait:
+            self.stop_now.wait(STOP_AFTER_MATCH)
+        with self.record_lock:
+            if not recording or self.recording is not recording:
+                return  # already finished
+            self.recording = None
+            try:
+                while not self.record_stopped.empty():
+                    self.record_stopped.get_nowait()
+                path = self.obs.request("StopRecord").get("outputPath")
+                try:
+                    path = self.record_stopped.get(timeout=30) or path  # wait until OBS has closed the file
+                except queue.Empty:
+                    pass
+                self.work.put(("match", path, recording))
+            except (OBSError, ConnectionError, AttributeError) as e:
+                log(f"Couldn't stop the recording: {e}")
+
+    def process_match(self, path, recording):
+        match, started = recording["match"], recording["started"]
+        when = datetime.fromtimestamp(match["start"])
+        label = f"vs {match['opponent'] or 'unknown'}" + (f" ({match['result']})" if match["result"] else "")
+        full = file_capture(path, ARENA, when, label)
+        events = [dict(e, video_time=round(e["t"] - started, 2)) for e in match["events"]]
+        info = {k: v for k, v in match.items() if k != "events"}
+        info.update(recording_started=started, events=events)
+        full.with_suffix(".events.json").write_text(json.dumps(info, indent=1))
+        log(f"Saved match -> {full.parent.name}/{full.name} ({full.stat().st_size / 1e6:.0f} MB)")
+
+        keep = [(e["video_time"] - MTGA_KEEP[e["type"]][0], e["video_time"] + MTGA_KEEP[e["type"]][1])
+                for e in events if e["type"] in MTGA_KEEP]
+        log("Trimming idle time…")
+        trimmed, message = trimmer().export_clip(full, "original", "aggressive", full.stem + " - trimmed",
+                                                 must_keep=keep)
+        log(message.replace("Saved ", "Saved trimmed -> "))
 
     def worker(self):
         while True:
-            path, game, when = self.work.get()
+            item = self.work.get()
             try:
-                target = file_capture(path, game, when)
-                log(f"Saved replay -> {target.parent.name}/{target.name}")
+                if item[0] == "replay":
+                    target = file_capture(*item[1:])
+                    log(f"Saved replay -> {target.parent.name}/{target.name}")
+                else:
+                    self.process_match(*item[1:])
             except Exception as e:
-                log(f"Couldn't file {path}: {e}")
+                log(f"Couldn't file {item[1]}: {e}")
 
     def run(self):
         threading.Thread(target=self.worker, daemon=True).start()
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import arena_log
+        tracker = arena_log.MatchTracker(
+            on_start=self.match_started,
+            on_end=lambda m: threading.Thread(target=self.match_ended, args=(m,), daemon=True).start())
+        arena_log.LogWatcher(tracker, os.environ.get("CLIP_AGENT_ARENA_LOG")).start()
         password, asked = load_password(), False
         waiting_note = False
         while True:
@@ -382,7 +502,8 @@ class Agent:
             if asked and save_password(password):
                 log("Password saved in Windows Credential Manager as " + CREDENTIAL_NAME)
             asked, waiting_note = False, False
-            log(f"Connected to OBS (WebSocket {obs.version}).")
+            log(f"Connected to OBS (WebSocket {obs.version}). Watching for Arena matches.")
+            self.obs = obs
             self.restart_buffer = True
             try:
                 while not obs.closed.wait(2):
@@ -399,6 +520,7 @@ class Agent:
                     log(str(e))
             except ConnectionError:
                 pass
+            self.obs = None
             obs.close()
             log("Lost connection to OBS.")
 

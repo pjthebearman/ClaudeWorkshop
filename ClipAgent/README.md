@@ -23,15 +23,38 @@ Videos\Captures\Magic The Gathering Arena\Magic The Gathering Arena 2026-11-03 2
 Raw captures live in `Captures`; finished clips from Clip Trimmer go to
 `Clips`. If OBS is closed, the agent waits and reconnects when it's back.
 
+### MTG Arena matches
+
+With Arena's **Detailed Logs** on, the agent follows Arena's log and records
+every match from start to finish (plus a few seconds of the result screen):
+
+```
+Videos\Captures\Magic The Gathering Arena\
+    Magic The Gathering Arena 2026-11-02 19-25-20 vs Axdan (Win).mp4           full match
+    Magic The Gathering Arena 2026-11-02 19-25-20 vs Axdan (Win).events.json   what happened, and when in the video
+Videos\Clips\Magic The Gathering Arena\
+    Magic The Gathering Arena 2026-11-02 19-25-20 vs Axdan (Win) - trimmed.mp4
+```
+
+The timeline lists turns, lands, spells cast and resolved, attacks, damage,
+life changes, removal and the result, each tagged *me* or *opponent*. The
+trimmed copy uses aggressive idle-time cutting, but always keeps a few seconds
+around casts, attacks, damage, removal, new turns and the game end (the
+first **MTGA profile**). Trimming runs at low priority so it doesn't slow your
+next match. If OBS is already recording when a match starts, the agent leaves
+it alone.
+
+`arena_log.py` can also be run on its own (`python arena_log.py Player.log`)
+to print every match in a log.
+
 ## Plan
 
 1. **Capture:** OBS with a 5-minute replay buffer and game/mic/voice-chat
    audio on separate tracks; saved replays filed automatically. *(done)*
-2. **MTG Arena matches:** read Arena's log (`Player.log`, Detailed Logs on);
-   start recording when a match starts and stop when it ends; name the file
-   with date, opponent and result; save a timeline of match events beside it;
-   make one trimmed video per match. Full matches are kept for now, to see
-   how much disk space they use.
+2. **MTG Arena matches:** record each match from Arena's log, name it with
+   the opponent and result, save its event timeline, and make one trimmed
+   video per match. Full matches are kept for now, to see how much disk
+   space they use. *(done, awaiting a real-world test)*
 3. **WoW Forever moments:** a small addon marks moments (see below), the agent
    saves the replay buffer around each one and files the clip.
 4. **Profiles:** trimming rules per game and clip type (MTGA, WoW boss kill,
